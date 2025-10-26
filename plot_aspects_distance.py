@@ -21,13 +21,15 @@ Usage examples:
 import argparse
 from pathlib import Path
 import re, datetime as dt
+import calendar
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as ticker
 
-# --- Palette (same as your longitude script) ---
+
 PLANET_COLORS = {
     "Sun":        "#DAA520",
     "Moon":       "#A9A9A9",
@@ -86,62 +88,133 @@ def nearest_distance(delta_deg: float, targets: list[float]) -> float:
 def month_count(start: pd.Timestamp, end: pd.Timestamp) -> int:
     return (end.year - start.year) * 12 + (end.month - start.month) + 1
 
+def _iter_month_starts(start: pd.Timestamp, end: pd.Timestamp):
+    cur = pd.Timestamp(start.year, start.month, 1)
+    cur = cur - pd.offsets.MonthBegin(1)  # include the boundary before start
+    while cur <= end:
+        yield cur.to_pydatetime()
+        cur = cur + pd.offsets.MonthBegin(1)
+
 def setup_time_axis(ax, dt_index: pd.DatetimeIndex):
     """
-    - Major ticks at EVERY month (bold/long).
-    - Weekly minor grid (lighter).
-    - Label only every 1/2/3 months depending on total span,
-      but keep the monthly ticks/lines regardless.
+    Adaptive x-axis:
+
+      <= 12 months:  Major = Month(1) labels,  Minor = Week(Mon)
+      <= 36 months:  Major = Month(1) labels,  Minor = Month(1) (lighter grid)
+      <= 120 months: Major = Month(3) labels,  Minor = Month(1)
+      <= 240 months: Major = Year(1)  labels,  Minor = Month(3)
+      <= 480 months: Major = Year(2)  labels,  Minor = Year(1)
+      <= 1200 months:Major = Year(5)  labels,  Minor = Year(1)
+      >  1200 months:Major = Year(10) labels,  Minor = Year(1)  (200-year mode)
+
+    Always:
+      - Bold/long marks at each **major** tick.
+      - Vertical grid for major (stronger) and minor (lighter).
+      - Every subplot shows labels (even with sharex=True).
+      - For long spans: draw **year lines** lightly, **decade lines** stronger, and
+        **century lines** strongest; label every decade.
     """
     start, end = dt_index[0], dt_index[-1]
     months = month_count(start, end)
 
-    # Minor ticks: weekly (every Monday)
-    ax.xaxis.set_minor_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    # reset any previous locators cleanly
+    ax.xaxis.set_major_locator(ticker.NullLocator())
+    ax.xaxis.set_minor_locator(ticker.NullLocator())
 
-    # Major ticks: EVERY month (ensures bold/long marks line up with month lines)
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    draw_month_lines = False
+    draw_year_grid   = False
+    label_every_n_months = None
+    label_every_n_years  = None
 
-    # Tick styling (major longer/bolder than minor)
-    ax.tick_params(axis='x', which='major', length=12, width=1.3, labelsize=9, labelrotation=0)
+    if months <= 12:
+        major_loc = mdates.MonthLocator(interval=1)
+        minor_loc = mdates.WeekdayLocator(byweekday=mdates.MO)
+        fmt       = mdates.DateFormatter('%d %b %Y')
+        draw_month_lines = True
+        label_every_n_months = 1
+    elif months <= 36:
+        major_loc = mdates.MonthLocator(interval=1)
+        minor_loc = mdates.MonthLocator(interval=1)
+        fmt       = mdates.DateFormatter('%b %Y')
+        draw_month_lines = True
+        label_every_n_months = 1
+    elif months <= 120:
+        major_loc = mdates.MonthLocator(interval=3)
+        minor_loc = mdates.MonthLocator(interval=1)
+        fmt       = mdates.DateFormatter('%b %Y')
+        draw_month_lines = True
+        label_every_n_months = 3
+    elif months <= 240:
+        major_loc = mdates.YearLocator(base=1)
+        minor_loc = mdates.MonthLocator(interval=3)
+        fmt       = mdates.DateFormatter('%Y')
+        draw_year_grid = True
+        label_every_n_years = 1
+    elif months <= 480:
+        major_loc = mdates.YearLocator(base=2)
+        minor_loc = mdates.YearLocator(base=1)
+        fmt       = mdates.DateFormatter('%Y')
+        draw_year_grid = True
+        label_every_n_years = 2
+    elif months <= 1200:
+        major_loc = mdates.YearLocator(base=5)
+        minor_loc = mdates.YearLocator(base=1)
+        fmt       = mdates.DateFormatter('%Y')
+        draw_year_grid = True
+        label_every_n_years = 5
+    else:
+        # 200-year window (or bigger): decade labels, yearly minors
+        major_loc = mdates.YearLocator(base=10)   # 1900, 1910, ..., 2100
+        minor_loc = mdates.YearLocator(base=1)    # every year
+        fmt       = mdates.DateFormatter('%Y')
+        draw_year_grid = True
+        label_every_n_years = 10
+
+    # apply locators/formatter
+    ax.xaxis.set_major_locator(major_loc)
+    ax.xaxis.set_major_formatter(fmt)
+    ax.xaxis.set_minor_locator(minor_loc)
+
+    # tick styling
+    ax.tick_params(axis='x', which='major', length=12, width=1.3, labelsize=9)
     ax.tick_params(axis='x', which='minor', length=4,  width=0.8)
+    ax.tick_params(axis='x', which='major', labelbottom=True)  # show labels on every subplot
 
-    # Show labels on ALL subplots (even with sharex=True)
-    ax.tick_params(axis='x', which='major', labelbottom=True)
+    # vertical grid
+    ax.grid(which='major', axis='x', linestyle='--', linewidth=0.9, alpha=0.65, zorder=0)
+    ax.grid(which='minor', axis='x', linestyle=':',  linewidth=0.6, alpha=0.35, zorder=0)
 
-    # Thin labels but keep monthly ticks:
-    step = 1 if months <= 12 else (2 if months <= 24 else 3)
-    # Make labels, then hide some by index
-    labels = ax.get_xticklabels()
-    for i, lab in enumerate(labels):
-        lab.set_visible(i % step == 0)
-        lab.set_fontweight('bold')  # emphasize month labels
+    # month markers for short spans
+    if draw_month_lines:
+        for m in _iter_month_starts(start, end):
+            ax.axvline(m, color='0.85', lw=0.6, alpha=0.6, zorder=0)
+        if label_every_n_months:
+            for i, lab in enumerate(ax.get_xticklabels()):
+                lab.set_visible((i % label_every_n_months) == 0)
+                if lab.get_visible():
+                    lab.set_fontweight('bold')
 
-    # Vertical grid: stronger for major (months), lighter for minor (weeks)
-    ax.grid(which='major', axis='x', linestyle='--', linewidth=0.9, alpha=0.65)
-    ax.grid(which='minor', axis='x', linestyle=':',  linewidth=0.6, alpha=0.35)
+    # year/decade/century markers for long spans
+    if draw_year_grid:
+        y0, y1 = ax.get_ylim()
+        year_start = start.year
+        year_end   = end.year + 1
 
-    # Subtle vertical line at EVERY month boundary (even if not labeled)
-    # (This is redundant where a major grid line already exists, but keeps
-    #  month markers consistent when labels are thinned.)
-    # Build a list of month starts from just before start to beyond end.
-    cur = dt.datetime(start.year, start.month, 1)
-    if start.day != 1:
-        # include the boundary immediately before the visible window
-        if cur.month == 1:
-            cur = dt.datetime(cur.year - 1, 12, 1)
-        else:
-            cur = dt.datetime(cur.year, cur.month - 1, 1)
-    month_starts = []
-    while cur <= end:
-        month_starts.append(cur)
-        if cur.month == 12:
-            cur = dt.datetime(cur.year + 1, 1, 1)
-        else:
-            cur = dt.datetime(cur.year, cur.month + 1, 1)
-    for m in month_starts:
-        ax.axvline(m, color='0.85', lw=0.6, alpha=0.6, zorder=0)
+        for y in range(year_start, year_end):
+            dty = dt.datetime(y, 1, 1)
+            if y % 100 == 0:       # century
+                ax.axvline(dty, color='0.55', lw=1.6, alpha=0.8, zorder=0)
+            elif y % 10 == 0:      # decade
+                ax.axvline(dty, color='0.70', lw=1.0, alpha=0.7, zorder=0)
+            else:                   # every year
+                ax.axvline(dty, color='0.88', lw=0.6, alpha=0.6, zorder=0)
+
+        # only show labels at the major cadence (1/2/5/10-year)
+        if label_every_n_years:
+            labs = ax.get_xticklabels()
+            for i, lab in enumerate(labs):
+                lab.set_visible((i % 1) == 0)  # all major ticks are already at the cadence
+                lab.set_fontweight('bold')
 
 # --- Main plotting ---
 ASPECTS = {
